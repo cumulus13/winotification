@@ -1,0 +1,111 @@
+# WiNotification Configuration
+# Author: Hadi Cahyadi <cumulus13@gmail.com>
+# Homepage: github.com/cumulus13/WiNotification
+
+[general]
+# Application log level: debug, info, warn, error
+log_level = "info"
+# Log file path (empty = stdout only)
+log_file = "winotification.log"
+# Icon path for systray (relative to binary or absolute)
+icon_path = "icons/icon.ico"
+# Capture interval in milliseconds
+capture_interval_ms = 500
+# Filter: only forward notifications matching these app names (empty = all)
+filter_apps = []
+# Filter: skip notifications from these app names
+ignore_apps = ["Microsoft.WindowsStore"]
+
+# ─────────────────────────────────────────────────────────────
+# GROWL (GNTP)
+# ─────────────────────────────────────────────────────────────
+[growl]
+enabled = false
+host = "127.0.0.1"
+port = 23053
+password = ""
+# Application name shown in Growl
+app_name = "WiNotification"
+# Path to icon sent to Growl (PNG recommended)
+icon = "icons/icon.png"
+
+# ─────────────────────────────────────────────────────────────
+# NTFY
+# ─────────────────────────────────────────────────────────────
+[ntfy]
+enabled = true
+server_url = "https://ntfy.sh"
+topic = "winotification"
+# Leave empty for no auth
+token = ""
+# Icon URL shown in ntfy push (fetched from internet)
+icon_url = "https://raw.githubusercontent.com/cumulus13/WiNotification/main/icons/icon.png"
+# Priority: min, low, default, high, urgent
+priority = "default"
+
+# ─────────────────────────────────────────────────────────────
+# RABBITMQ
+# ─────────────────────────────────────────────────────────────
+[rabbitmq]
+enabled = false
+url = "amqp://guest:guest@localhost:5672/"
+exchange = "winotification"
+exchange_type = "fanout"
+routing_key = ""
+durable = true
+
+# ─────────────────────────────────────────────────────────────
+# ZEROMQ
+# ─────────────────────────────────────────────────────────────
+[zeromq]
+enabled = false
+# Socket type: pub, push
+socket_type = "pub"
+# Bind address
+bind = "tcp://*:5556"
+
+# ─────────────────────────────────────────────────────────────
+# REDIS
+# ─────────────────────────────────────────────────────────────
+[redis]
+enabled = false
+host = "127.0.0.1"
+port = 6379
+password = ""
+db = 0
+# Key prefix for stored notifications
+key_prefix = "winotif:"
+# TTL in seconds (0 = no expiry)
+ttl = 86400
+# Also publish to channel?
+pubsub_channel = "winotification"
+publish = true
+
+# ─────────────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────────────
+[database]
+enabled = false
+# type: sqlite, mysql, postgres, sqlserver
+type = "sqlite"
+host = "localhost"
+port = 5432
+username = "winotif"
+password = ""
+dbname = "winotification"
+# sqlite file path (only for sqlite type)
+sqlite_path = "winotification.db"
+# Extra DSN params
+params = ""
+
+# ─────────────────────────────────────────────────────────────
+# TOAST (Windows Toast Notification re-broadcast)
+# ─────────────────────────────────────────────────────────────
+[toast]
+enabled = false
+# App ID shown in Action Center
+app_id = "WiNotification"
+# Duration: short, long
+duration = "short"
+# Audio: ms-winsoundevent:Notification.Default, silent, etc.
+audio = "ms-winsoundevent:Notification.Default"

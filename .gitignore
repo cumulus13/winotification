@@ -1,0 +1,24 @@
+# Build artefacts
+dist/
+*.exe
+
+# Go
+vendor/
+
+# Logs & DB
+*.log
+*.db
+
+# Secrets (never commit real config with passwords)
+config.local.toml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Added entries (4 items)
+*sublime*
+PLAN.md
+bin/
+obj/
