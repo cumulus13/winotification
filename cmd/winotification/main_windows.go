@@ -28,7 +28,9 @@ const version = "1.0.0"
 func main() {
 	cfgFile := flag.String("config", "config.toml", "Path to configuration file")
 	showVer := flag.Bool("version", false, "Print version and exit")
-	reqAccess := flag.Bool("request-access", false, "Request Windows notification access and exit")
+	// --request-access kept for backwards compatibility but is now a no-op:
+	// the WinEvent hook engine requires no UWP package identity or user consent.
+	reqAccess := flag.Bool("request-access", false, "(no-op) Previously required for UserNotificationListener; not needed with WinEvent hook engine")
 	flag.Parse()
 
 	if *showVer {
@@ -49,27 +51,24 @@ func main() {
 
 	// ── One-shot: request notification access ────────────────
 	if *reqAccess {
-		if err := capture.RequestAccess(log); err != nil {
-			log.WithError(err).Fatal("Could not request notification access")
-		}
-		log.Info("Access requested. Please accept the system prompt then re-run without --request-access.")
+		capture.RequestAccess(log) // prints informational message and returns
 		os.Exit(0)
 	}
 
 	// ── Build forwarders ─────────────────────────────────────
-	var fwds []forwarder.Forwarder
+	// Growl is initialised in a background goroutine so that a slow or
+	// unreachable Growl server does not block startup. All other forwarders
+	// connect inline with their own short timeouts (Redis 5s, etc.).
+	dispatcher := forwarder.NewDispatcher(log)
+	defer dispatcher.Close()
 
-	if cfg.Growl.Enabled {
-		gf, err := forwarder.NewGrowlForwarder(cfg.Growl, log)
-		if err != nil {
-			log.WithError(err).Warn("Growl forwarder disabled (connection failed)")
-		} else {
-			fwds = append(fwds, gf)
-		}
+	// Add all non-blocking forwarders immediately
+	if cfg.Ntfy.Enabled {
+		dispatcher.Add(forwarder.NewNtfyForwarder(cfg.Ntfy, log))
 	}
 
-	if cfg.Ntfy.Enabled {
-		fwds = append(fwds, forwarder.NewNtfyForwarder(cfg.Ntfy, log))
+	if cfg.Toast.Enabled {
+		dispatcher.Add(forwarder.NewToastForwarder(cfg.Toast, log))
 	}
 
 	if cfg.RabbitMQ.Enabled {
@@ -77,7 +76,7 @@ func main() {
 		if err != nil {
 			log.WithError(err).Warn("RabbitMQ forwarder disabled")
 		} else {
-			fwds = append(fwds, rf)
+			dispatcher.Add(rf)
 		}
 	}
 
@@ -86,7 +85,7 @@ func main() {
 		if err != nil {
 			log.WithError(err).Warn("ZeroMQ forwarder disabled")
 		} else {
-			fwds = append(fwds, zf)
+			dispatcher.Add(zf)
 		}
 	}
 
@@ -95,7 +94,7 @@ func main() {
 		if err != nil {
 			log.WithError(err).Warn("Redis forwarder disabled")
 		} else {
-			fwds = append(fwds, rdf)
+			dispatcher.Add(rdf)
 		}
 	}
 
@@ -104,21 +103,22 @@ func main() {
 		if err != nil {
 			log.WithError(err).Warn("Database forwarder disabled")
 		} else {
-			fwds = append(fwds, dbf)
+			dispatcher.Add(dbf)
 		}
 	}
 
-	if cfg.Toast.Enabled {
-		fwds = append(fwds, forwarder.NewToastForwarder(cfg.Toast, log))
+	// Growl: connect in background — Register() blocks for up to 5s (TCP timeout)
+	if cfg.Growl.Enabled {
+		go func() {
+			gf, err := forwarder.NewGrowlForwarder(cfg.Growl, log)
+			if err != nil {
+				log.WithError(err).Warn("Growl forwarder disabled (connection failed)")
+				return
+			}
+			dispatcher.Add(gf)
+			log.Info("Growl forwarder connected and ready")
+		}()
 	}
-
-	if len(fwds) == 0 {
-		log.Warn("No forwarders are enabled — notifications will be captured but not forwarded")
-	}
-
-	// ── Dispatcher ───────────────────────────────────────────
-	dispatcher := forwarder.NewDispatcher(log, fwds...)
-	defer dispatcher.Close()
 
 	// ── Context + systray ────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())

@@ -20,7 +20,7 @@ ignore_apps = ["Microsoft.WindowsStore"]
 # GROWL (GNTP)
 # ─────────────────────────────────────────────────────────────
 [growl]
-enabled = false
+enabled = true
 host = "127.0.0.1"
 port = 23053
 password = ""
@@ -102,7 +102,7 @@ params = ""
 # TOAST (Windows Toast Notification re-broadcast)
 # ─────────────────────────────────────────────────────────────
 [toast]
-enabled = false
+enabled = true
 # App ID shown in Action Center
 app_id = "WiNotification"
 # Duration: short, long

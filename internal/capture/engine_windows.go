@@ -1,38 +1,97 @@
 //go:build windows
 
+// Package capture intercepts Windows notifications using two complementary methods:
+//
+//  1. SetWinEventHook (EVENT_SYSTEM_ALERT) — fires the moment a toast popup
+//     appears. Works for ALL apps, no package identity required.
+//
+//  2. Action Center poll via EnumChildWindows — reads queued notifications
+//     from the Action Center window so existing notifications are also captured.
+//
+// Why NOT UserNotificationListener:
+//   Windows.UI.Notifications.Management.UserNotificationListener silently
+//   returns zero results from a plain Win32 exe even when AccessStatus=Allowed.
+//   It only works from a packaged UWP/MSIX process with a registered AppUserModelId.
+//
+// Author:   Hadi Cahyadi <cumulus13@gmail.com>
+// Homepage: github.com/cumulus13/WiNotification
 package capture
 
 import (
 	"context"
-	"encoding/xml"
+	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
-	"github.com/go-ole/go-ole"
-	"github.com/go-ole/go-ole/oleutil"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/windows"
 )
 
-// Engine captures Windows toast/Action-Center notifications via the
-// Windows.UI.Notifications.Management.UserNotificationListener WinRT API.
-//
-// It polls the notification list at a configurable interval because the
-// WinRT event subscription model requires a full UWP/MSIX context that a
-// plain Win32 process cannot host cleanly. Polling works reliably from
-// Windows 10 1709 onward.
+// ── Win32 constants ───────────────────────────────────────────────────────────
+
+const (
+	WINEVENT_OUTOFCONTEXT  = 0x0000
+	WINEVENT_SKIPOWNTHREAD = 0x0001
+
+	EVENT_SYSTEM_ALERT  = 0x0002
+	EVENT_OBJECT_CREATE = 0x8000
+
+	WM_QUIT = 0x0012
+)
+
+// ── DLL + proc references ─────────────────────────────────────────────────────
+
+var (
+	modUser32   = windows.NewLazySystemDLL("user32.dll")
+	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
+
+	// user32.dll — UI / message / hook functions
+	procSetWinEventHook    = modUser32.NewProc("SetWinEventHook")
+	procUnhookWinEvent     = modUser32.NewProc("UnhookWinEvent")
+	procGetMessageW        = modUser32.NewProc("GetMessageW")
+	procTranslateMessage   = modUser32.NewProc("TranslateMessage")
+	procDispatchMessageW   = modUser32.NewProc("DispatchMessageW")
+	procPostThreadMessageW = modUser32.NewProc("PostThreadMessageW")
+	procFindWindowW        = modUser32.NewProc("FindWindowW")
+	procGetWindowTextW     = modUser32.NewProc("GetWindowTextW")
+	procGetClassNameW      = modUser32.NewProc("GetClassNameW")
+	procEnumChildWindows   = modUser32.NewProc("EnumChildWindows")
+	procIsWindowVisible    = modUser32.NewProc("IsWindowVisible")
+
+	// kernel32.dll — thread / process functions
+	procGetCurrentThreadId = modKernel32.NewProc("GetCurrentThreadId")
+)
+
+// MSG mirrors the Win32 MSG structure.
+type msgStruct struct {
+	Hwnd    uintptr
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	PtX     int32
+	PtY     int32
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+
+// Engine captures Windows toast notifications via WinEvent hooks.
+// It must be Run() which internally locks to an OS thread for hook affinity.
 type Engine struct {
 	intervalMs int
 	filterApps map[string]struct{}
 	ignoreApps map[string]struct{}
 	logger     *logrus.Logger
 	out        chan<- *Notification
-	seen       map[uint32]struct{} // sequence numbers already dispatched
-	mu         sync.Mutex
+
+	mu   sync.Mutex
+	seen map[string]time.Time // dedup: content-key → last seen time
 }
 
-// NewEngine creates a capture engine that writes new notifications to out.
 func NewEngine(
 	intervalMs int,
 	filterApps []string,
@@ -54,345 +113,312 @@ func NewEngine(
 		ignoreApps: ia,
 		logger:     log,
 		out:        out,
-		seen:       make(map[uint32]struct{}),
+		seen:       make(map[string]time.Time),
 	}
 }
 
-// Run starts the capture loop and blocks until ctx is cancelled.
+// Run locks an OS thread, installs WinEvent hooks, and pumps Win32 messages
+// until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
-	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
-		// Already initialised in this thread is OK (S_FALSE = 1)
-		if oleErr, ok := err.(*ole.OleError); !ok || oleErr.Code() != 0x00000001 {
-			return err
-		}
+	errCh := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		errCh <- e.messageLoop(ctx)
+	}()
+	return <-errCh
+}
+
+func (e *Engine) messageLoop(ctx context.Context) error {
+	tidRet, _, _ := procGetCurrentThreadId.Call()
+	threadID := uint32(tidRet)
+
+	// ── WinEvent hook: EVENT_SYSTEM_ALERT ────────────────────────────────
+	// Fires when a toast notification is shown (by any process).
+	cbAlert := windows.NewCallback(e.onWinEvent)
+	hAlert, _, _ := procSetWinEventHook.Call(
+		uintptr(EVENT_SYSTEM_ALERT), uintptr(EVENT_SYSTEM_ALERT),
+		0, cbAlert, 0, 0,
+		uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNTHREAD),
+	)
+	if hAlert == 0 {
+		return fmt.Errorf("SetWinEventHook(EVENT_SYSTEM_ALERT) returned NULL")
 	}
-	defer ole.CoUninitialize()
+	defer procUnhookWinEvent.Call(hAlert)
 
-	ticker := time.NewTicker(time.Duration(e.intervalMs) * time.Millisecond)
-	defer ticker.Stop()
+	// ── WinEvent hook: EVENT_OBJECT_CREATE ───────────────────────────────
+	// Catches notification windows that don't emit SYSTEM_ALERT.
+	cbCreate := windows.NewCallback(e.onWinEvent)
+	hCreate, _, _ := procSetWinEventHook.Call(
+		uintptr(EVENT_OBJECT_CREATE), uintptr(EVENT_OBJECT_CREATE),
+		0, cbCreate, 0, 0,
+		uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNTHREAD),
+	)
+	if hCreate != 0 {
+		defer procUnhookWinEvent.Call(hCreate)
+	}
 
-	e.logger.Info("Capture engine started (polling interval: ", e.intervalMs, "ms)")
+	e.logger.Infof("Capture engine started — WinEvent hooks active on thread %d", threadID)
 
-	for {
-		select {
-		case <-ctx.Done():
-			e.logger.Info("Capture engine stopped")
-			return nil
-		case <-ticker.C:
-			if err := e.poll(); err != nil {
-				e.logger.WithError(err).Debug("Poll error (will retry)")
+	// Action Center poll runs concurrently on a regular goroutine (not hook-thread).
+	go func() {
+		t := time.NewTicker(time.Duration(e.intervalMs) * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				e.pollActionCenter()
 			}
 		}
-	}
-}
+	}()
 
-// poll reads all current UserNotifications from the WinRT listener.
-func (e *Engine) poll() error {
-	// Activate UserNotificationListener
-	listener, err := e.activateListener()
-	if err != nil {
-		return err
-	}
-	defer listener.Release()
+	// Break the message loop when context is cancelled.
+	go func() {
+		<-ctx.Done()
+		procPostThreadMessageW.Call(uintptr(threadID), WM_QUIT, 0, 0)
+	}()
 
-	// Check access — the user must have granted notification access
-	// to this application (done once via requestAccess on first run).
-	accessStatus, err := e.getAccessStatus(listener)
-	if err != nil {
-		return err
-	}
-	if accessStatus != 2 { // UserNotificationListenerAccessStatus.Allowed == 2
-		e.logger.Warn("Notification listener access not granted (status=", accessStatus, "). Run once as admin or grant in Windows Settings.")
-		return nil
-	}
-
-	// GetNotifications(NotificationKindToast | NotificationKindTile = 0x3)
-	notifications, err := oleutil.CallMethod(listener, "GetNotifications", int32(3))
-	if err != nil {
-		return err
-	}
-	defer notifications.Clear()
-
-	notifList := notifications.ToIDispatch()
-	if notifList == nil {
-		return nil
-	}
-	defer notifList.Release()
-
-	countV, err := oleutil.GetProperty(notifList, "Size")
-	if err != nil {
-		return err
-	}
-	count := int(countV.Val)
-
-	for i := 0; i < count; i++ {
-		itemV, err := oleutil.CallMethod(notifList, "GetAt", uint32(i))
-		if err != nil {
-			continue
+	// Win32 message pump — keeps the hook alive.
+	var msg msgStruct
+	for {
+		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if r == 0 || r == ^uintptr(0) {
+			break // WM_QUIT or error
 		}
-		item := itemV.ToIDispatch()
-		if item == nil {
-			continue
-		}
-
-		n, err := e.parseUserNotification(item)
-		item.Release()
-		if err != nil || n == nil {
-			continue
-		}
-
-		e.mu.Lock()
-		_, seen := e.seen[n.Sequence]
-		if !seen {
-			e.seen[n.Sequence] = struct{}{}
-		}
-		e.mu.Unlock()
-
-		if seen {
-			continue
-		}
-
-		if !e.shouldForward(n) {
-			continue
-		}
-
-		select {
-		case e.out <- n:
-		default:
-			e.logger.Warn("Notification channel full, dropping: ", n.Title)
-		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 
+	e.logger.Info("Capture engine stopped")
 	return nil
 }
 
-func (e *Engine) activateListener() (*ole.IDispatch, error) {
-	unknown, err := oleutil.CreateObject("Windows.UI.Notifications.Management.UserNotificationListener")
-	if err != nil {
-		// Fallback: GetActivationFactory
-		return nil, err
+// onWinEvent is the WinEvent hook callback.
+// Called on the hook thread for each EVENT_SYSTEM_ALERT / EVENT_OBJECT_CREATE.
+// Signature matches WINEVENTPROC: (hook, event, hwnd, idObject, idChild, thread, time)
+func (e *Engine) onWinEvent(hook, event uintptr, hwnd uintptr, idObject, idChild int32, eventThread, eventTime uint32) uintptr {
+	if hwnd == 0 {
+		return 0
 	}
-	dispatch, err := unknown.QueryInterface(ole.IID_IDispatch)
-	if err != nil {
-		unknown.Release()
-		return nil, err
+
+	className := winGetClassName(hwnd)
+
+	// Toast popup window class names seen on Windows 10/11:
+	isToastWindow :=
+		strings.Contains(className, "Toast") ||
+			strings.EqualFold(className, "Windows.UI.Core.CoreWindow") ||
+			strings.Contains(className, "NativeHWNDHost") ||
+			strings.Contains(className, "XamlExplicitAnimationTrigger")
+
+	if !isToastWindow {
+		return 0
 	}
-	unknown.Release()
-	return dispatch, nil
+
+	e.extractAndEmit(hwnd, "")
+	return 0
 }
 
-func (e *Engine) getAccessStatus(listener *ole.IDispatch) (int, error) {
-	v, err := oleutil.GetProperty(listener, "AccessStatus")
-	if err != nil {
-		return 0, err
+// pollActionCenter reads the currently open Action Center (notification flyout)
+// and emits unseen notifications. This catches pre-existing notifications and
+// apps that don't fire WinEvent hooks.
+func (e *Engine) pollActionCenter() {
+	hwnd := findNotificationWindow()
+	if hwnd == 0 {
+		return
 	}
-	return int(v.Val), nil
+	e.extractAndEmit(hwnd, "ActionCenter")
 }
 
-func (e *Engine) parseUserNotification(item *ole.IDispatch) (*Notification, error) {
-	seqV, err := oleutil.GetProperty(item, "Id")
-	if err != nil {
-		return nil, err
-	}
-	seq := uint32(seqV.Val)
-
-	// AppInfo
-	appInfoV, err := oleutil.GetProperty(item, "AppInfo")
-	if err != nil {
-		return nil, err
-	}
-	appInfo := appInfoV.ToIDispatch()
-	if appInfo == nil {
-		return nil, nil
-	}
-	defer appInfo.Release()
-
-	appIdV, _ := oleutil.GetProperty(appInfo, "AppUserModelId")
-	appName := appIdV.ToString()
-
-	// Notification
-	notifV, err := oleutil.GetProperty(item, "Notification")
-	if err != nil {
-		return nil, err
-	}
-	notif := notifV.ToIDispatch()
-	if notif == nil {
-		return nil, nil
-	}
-	defer notif.Release()
-
-	tagV, _ := oleutil.GetProperty(notif, "Tag")
-	groupV, _ := oleutil.GetProperty(notif, "Group")
-
-	// Visual → Content (XML)
-	visualV, err := oleutil.GetProperty(notif, "Visual")
-	if err != nil {
-		return nil, err
-	}
-	visual := visualV.ToIDispatch()
-	if visual == nil {
-		return nil, nil
-	}
-	defer visual.Release()
-
-	bindingV, err := oleutil.CallMethod(visual, "GetBinding", "ToastGeneric")
-	if err != nil {
-		// Try fallback binding name
-		bindingV, err = oleutil.GetProperty(visual, "Content")
-		if err != nil {
-			return nil, nil
-		}
-	}
-	binding := bindingV.ToIDispatch()
-	if binding == nil {
-		return nil, nil
-	}
-	defer binding.Release()
-
-	title, body := extractTitleBody(binding)
-
-	n := &Notification{
-		ID:        uuid.New().String(),
-		AppName:   appName,
-		Title:     title,
-		Body:      body,
-		Tag:       tagV.ToString(),
-		Group:     groupV.ToString(),
-		Sequence:  seq,
-		ArrivedAt: time.Now().UTC(),
-	}
-	return n, nil
-}
-
-// extractTitleBody tries to pull title and body lines from a ToastBinding IDispatch.
-func extractTitleBody(binding *ole.IDispatch) (title, body string) {
-	// Try to get the XML payload of the content
-	contentV, err := oleutil.GetProperty(binding, "Content")
-	if err == nil && contentV != nil {
-		xmlDisp := contentV.ToIDispatch()
-		if xmlDisp != nil {
-			defer xmlDisp.Release()
-			xmlStrV, err := oleutil.CallMethod(xmlDisp, "GetXml")
-			if err == nil {
-				raw := xmlStrV.ToString()
-				title, body = parseToastXML(raw)
-				return
-			}
-		}
+// extractAndEmit reads all child window texts from hwnd, groups them into
+// notifications, and emits any that pass filter + dedup.
+func (e *Engine) extractAndEmit(hwnd uintptr, defaultApp string) {
+	texts := childWindowTexts(hwnd)
+	if len(texts) == 0 {
+		return
 	}
 
-	// Fallback: enumerate children
-	var lines []string
-	childrenV, err := oleutil.GetProperty(binding, "Children")
-	if err != nil {
-		return "", ""
+	// Filter out UI chrome strings
+	chrome := map[string]bool{
+		"clear all": true, "notifications": true, "notification center": true,
+		"settings": true, "focus assist": true, "see all": true,
 	}
-	children := childrenV.ToIDispatch()
-	if children == nil {
-		return "", ""
-	}
-	defer children.Release()
 
-	sizeV, _ := oleutil.GetProperty(children, "Size")
-	size := int(sizeV.Val)
-	for i := 0; i < size; i++ {
-		childV, err := oleutil.CallMethod(children, "GetAt", uint32(i))
-		if err != nil {
+	var clean []string
+	for _, t := range texts {
+		t = strings.TrimSpace(t)
+		if t == "" || chrome[strings.ToLower(t)] {
 			continue
 		}
-		child := childV.ToIDispatch()
-		if child == nil {
+		clean = append(clean, t)
+	}
+	if len(clean) == 0 {
+		return
+	}
+
+	appName := defaultApp
+	if appName == "" {
+		appName = winGetWindowText(hwnd)
+		if appName == "" {
+			appName = winGetClassName(hwnd)
+		}
+	}
+
+	// Heuristic grouping: treat first text as title, next as body.
+	// For the Action Center we may get many notifications; emit each pair.
+	for i := 0; i < len(clean); i++ {
+		title := clean[i]
+		body := ""
+		if i+1 < len(clean) {
+			body = clean[i+1]
+			i++ // consume body too
+		}
+
+		n := &Notification{
+			ID:        uuid.New().String(),
+			AppName:   appName,
+			Title:     title,
+			Body:      body,
+			ArrivedAt: time.Now().UTC(),
+		}
+
+		if !e.shouldForward(n) || e.isDuplicate(n) {
 			continue
 		}
-		textV, err := oleutil.GetProperty(child, "Text")
-		child.Release()
-		if err == nil {
-			lines = append(lines, textV.ToString())
+
+		e.logger.Infof("Captured [%s] %q — %q", n.AppName, n.Title, n.Body)
+		select {
+		case e.out <- n:
+		default:
+			e.logger.Warn("Output channel full, dropping: ", n.Title)
 		}
 	}
-	if len(lines) > 0 {
-		title = lines[0]
-	}
-	if len(lines) > 1 {
-		body = strings.Join(lines[1:], "\n")
-	}
-	return
 }
 
-// parseToastXML extracts title and body from a Windows toast XML document.
-func parseToastXML(raw string) (title, body string) {
-	type Text struct {
-		XMLName xml.Name `xml:"text"`
-		Value   string   `xml:",chardata"`
-	}
-	type Binding struct {
-		Texts []Text `xml:"text"`
-	}
-	type Visual struct {
-		Binding Binding `xml:"binding"`
-	}
-	type Toast struct {
-		Visual Visual `xml:"visual"`
-	}
+// ── De-duplication ────────────────────────────────────────────────────────────
 
-	var toast Toast
-	if err := xml.Unmarshal([]byte(raw), &toast); err != nil {
-		return raw, ""
-	}
-	texts := toast.Visual.Binding.Texts
-	if len(texts) > 0 {
-		title = texts[0].Value
-	}
-	if len(texts) > 1 {
-		var parts []string
-		for _, t := range texts[1:] {
-			parts = append(parts, t.Value)
+func dedupKey(n *Notification) string {
+	return strings.ToLower(n.Title) + "\x00" + strings.ToLower(n.Body)
+}
+
+func (e *Engine) isDuplicate(n *Notification) bool {
+	key := dedupKey(n)
+	now := time.Now()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Prune stale entries (older than 60s)
+	for k, t := range e.seen {
+		if now.Sub(t) > 60*time.Second {
+			delete(e.seen, k)
 		}
-		body = strings.Join(parts, "\n")
 	}
-	return
+
+	if last, ok := e.seen[key]; ok && now.Sub(last) < 60*time.Second {
+		return true
+	}
+	e.seen[key] = now
+	return false
 }
+
+// ── Filter ────────────────────────────────────────────────────────────────────
 
 func (e *Engine) shouldForward(n *Notification) bool {
 	lower := strings.ToLower(n.AppName)
-
 	if _, ignored := e.ignoreApps[lower]; ignored {
 		return false
 	}
 	if len(e.filterApps) > 0 {
-		_, allowed := e.filterApps[lower]
-		return allowed
+		_, ok := e.filterApps[lower]
+		return ok
 	}
 	return true
 }
 
-// RequestAccess requests UserNotificationListener access from Windows.
-// Must be called once before the capture loop; shows a system dialog.
-func RequestAccess(log *logrus.Logger) error {
-	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
-		if oleErr, ok := err.(*ole.OleError); !ok || oleErr.Code() != 0x00000001 {
-			return err
+// ── Win32 helpers ─────────────────────────────────────────────────────────────
+
+func winGetWindowText(hwnd uintptr) string {
+	buf := make([]uint16, 512)
+	procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return windows.UTF16ToString(buf)
+}
+
+func winGetClassName(hwnd uintptr) string {
+	buf := make([]uint16, 256)
+	procGetClassNameW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return windows.UTF16ToString(buf)
+}
+
+// childWindowTexts enumerates all child windows of hwnd and returns their texts.
+func childWindowTexts(hwnd uintptr) []string {
+	var texts []string
+	var mu sync.Mutex
+
+	cb := windows.NewCallback(func(child, _ uintptr) uintptr {
+		// Only visible windows have meaningful text
+		vis, _, _ := procIsWindowVisible.Call(child)
+		if vis == 0 {
+			return 1
+		}
+		t := winGetWindowText(child)
+		if t != "" {
+			mu.Lock()
+			texts = append(texts, t)
+			mu.Unlock()
+		}
+		return 1 // continue
+	})
+
+	procEnumChildWindows.Call(hwnd, cb, 0)
+	return texts
+}
+
+// findNotificationWindow tries known window class/title pairs for the Action Center.
+func findNotificationWindow() uintptr {
+	type candidate struct{ class, title string }
+	candidates := []candidate{
+		// Windows 10
+		{"Windows.UI.Core.CoreWindow", "Notification Center"},
+		// Windows 11
+		{"TopLevelWindowForOverflowXamlIsland", ""},
+		{"ActionCenter", ""},
+		// Fallback
+		{"Shell_TrayWnd", ""},
+	}
+
+	for _, c := range candidates {
+		var classPtr, titlePtr *uint16
+		if c.class != "" {
+			p, _ := windows.UTF16PtrFromString(c.class)
+			classPtr = p
+		}
+		if c.title != "" {
+			p, _ := windows.UTF16PtrFromString(c.title)
+			titlePtr = p
+		}
+		hwnd, _, _ := procFindWindowW.Call(
+			ptrOrZero(classPtr),
+			ptrOrZero(titlePtr),
+		)
+		if hwnd != 0 {
+			return hwnd
 		}
 	}
-	defer ole.CoUninitialize()
+	return 0
+}
 
-	unknown, err := oleutil.CreateObject("Windows.UI.Notifications.Management.UserNotificationListener")
-	if err != nil {
-		return err
+func ptrOrZero(p *uint16) uintptr {
+	if p == nil {
+		return 0
 	}
-	dispatch, err := unknown.QueryInterface(ole.IID_IDispatch)
-	if err != nil {
-		unknown.Release()
-		return err
-	}
-	defer dispatch.Release()
-	unknown.Release()
+	return uintptr(unsafe.Pointer(p))
+}
 
-	result, err := oleutil.CallMethod(dispatch, "RequestAccessAsync")
-	if err != nil {
-		log.WithError(err).Warn("RequestAccessAsync failed")
-		return err
-	}
-	log.Info("Notification access requested (status=", result.Val, ")")
+// RequestAccess is a no-op: the WinEvent hook approach needs no consent dialog.
+// Kept for --request-access CLI flag compatibility.
+func RequestAccess(log *logrus.Logger) error {
+	log.Info("WinEvent hook engine needs no special access grant — you can run normally.")
 	return nil
 }

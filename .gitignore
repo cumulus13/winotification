@@ -22,3 +22,9 @@ config.local.toml
 PLAN.md
 bin/
 obj/
+
+# Added entries (1 items)
+*chatgpt*
+
+# Added entries (1 items)
+example*.png
