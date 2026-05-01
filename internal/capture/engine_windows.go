@@ -1,17 +1,32 @@
 //go:build windows
 
-// Package capture intercepts Windows notifications using two complementary methods:
+// Package capture reads Windows notifications from the WPN (Windows Push
+// Notification) SQLite database — the only approach that reliably works from
+// a plain unpackaged Win32 exe without any special permissions.
 //
-//  1. SetWinEventHook (EVENT_SYSTEM_ALERT) — fires the moment a toast popup
-//     appears. Works for ALL apps, no package identity required.
+// Database location (per-user):
+//   %LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db
 //
-//  2. Action Center poll via EnumChildWindows — reads queued notifications
-//     from the Action Center window so existing notifications are also captured.
+// Schema (confirmed from forensic research and direct observation):
+//   Notification table:
+//     Id          INTEGER  — unique row ID, monotonically increasing
+//     HandlerId   INTEGER  — FK → NotificationHandler.RecordId
+//     Payload     BLOB     — XML content of the notification
+//     ArrivalTime INTEGER  — Windows FILETIME (100ns ticks since 1601-01-01)
+//     ExpiryTime  INTEGER  — expiry in same format
+//     Type        INTEGER  — notification type
 //
-// Why NOT UserNotificationListener:
-//   Windows.UI.Notifications.Management.UserNotificationListener silently
-//   returns zero results from a plain Win32 exe even when AccessStatus=Allowed.
-//   It only works from a packaged UWP/MSIX process with a registered AppUserModelId.
+//   NotificationHandler table:
+//     RecordId    INTEGER  — PK
+//     PrimaryId   TEXT     — app identifier (e.g. "Microsoft.Teams_...")
+//
+// Strategy:
+//   Poll the DB every intervalMs. Track the highest Id seen.
+//   On each poll, SELECT rows with Id > lastSeen, parse XML payload,
+//   emit as Notification. No hooks, no COM, no UWP, no permissions needed.
+//
+// The DB is opened with mode=ro&_journal_mode=WAL so we don't interfere with
+// the live WPN service writing to it.
 //
 // Author:   Hadi Cahyadi <cumulus13@gmail.com>
 // Homepage: github.com/cumulus13/WiNotification
@@ -19,77 +34,97 @@ package capture
 
 import (
 	"context"
+	"database/sql"
+	"encoding/xml"
 	"fmt"
-	"runtime"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/windows"
 )
 
-// ── Win32 constants ───────────────────────────────────────────────────────────
+// ── WPN database path ─────────────────────────────────────────────────────────
 
-const (
-	WINEVENT_OUTOFCONTEXT  = 0x0000
-	WINEVENT_SKIPOWNTHREAD = 0x0001
+func wpnDBPath() string {
+	local := os.Getenv("LOCALAPPDATA")
+	if local == "" {
+		// Fallback: construct from USERPROFILE
+		local = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
+	}
+	return filepath.Join(local, "Microsoft", "Windows", "Notifications", "wpndatabase.db")
+}
 
-	EVENT_SYSTEM_ALERT  = 0x0002
-	EVENT_OBJECT_CREATE = 0x8000
+// ── Toast XML parsing ─────────────────────────────────────────────────────────
 
-	WM_QUIT = 0x0012
-)
+// toastXML mirrors the structure of Windows toast notification XML payloads.
+type toastXML struct {
+	Visual struct {
+		Binding struct {
+			Texts []struct {
+				Value string `xml:",chardata"`
+			} `xml:"text"`
+		} `xml:"binding"`
+	} `xml:"visual"`
+}
 
-// ── DLL + proc references ─────────────────────────────────────────────────────
+// parsePayload extracts title and body from a Windows notification XML payload.
+// The payload is a BLOB that may be raw bytes or a UTF-8 XML string.
+func parsePayload(payload []byte) (title, body string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
 
-var (
-	modUser32   = windows.NewLazySystemDLL("user32.dll")
-	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	var toast toastXML
+	if err := xml.Unmarshal(payload, &toast); err != nil {
+		// Payload may not be valid XML (tile/badge types) — return raw trimmed.
+		s := strings.TrimSpace(string(payload))
+		if len(s) > 200 {
+			s = s[:200]
+		}
+		return s, ""
+	}
 
-	// user32.dll — UI / message / hook functions
-	procSetWinEventHook    = modUser32.NewProc("SetWinEventHook")
-	procUnhookWinEvent     = modUser32.NewProc("UnhookWinEvent")
-	procGetMessageW        = modUser32.NewProc("GetMessageW")
-	procTranslateMessage   = modUser32.NewProc("TranslateMessage")
-	procDispatchMessageW   = modUser32.NewProc("DispatchMessageW")
-	procPostThreadMessageW = modUser32.NewProc("PostThreadMessageW")
-	procFindWindowW        = modUser32.NewProc("FindWindowW")
-	procGetWindowTextW     = modUser32.NewProc("GetWindowTextW")
-	procGetClassNameW      = modUser32.NewProc("GetClassNameW")
-	procEnumChildWindows   = modUser32.NewProc("EnumChildWindows")
-	procIsWindowVisible    = modUser32.NewProc("IsWindowVisible")
+	texts := toast.Visual.Binding.Texts
+	if len(texts) == 0 {
+		return "", ""
+	}
+	title = strings.TrimSpace(texts[0].Value)
+	var parts []string
+	for _, t := range texts[1:] {
+		v := strings.TrimSpace(t.Value)
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	body = strings.Join(parts, "\n")
+	return
+}
 
-	// kernel32.dll — thread / process functions
-	procGetCurrentThreadId = modKernel32.NewProc("GetCurrentThreadId")
-)
-
-// MSG mirrors the Win32 MSG structure.
-type msgStruct struct {
-	Hwnd    uintptr
-	Message uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	PtX     int32
-	PtY     int32
+// filetimeToTime converts a Windows FILETIME integer to time.Time.
+// Formula: unix_seconds = (filetime / 10_000_000) - 11_644_473_600
+func filetimeToTime(ft int64) time.Time {
+	if ft == 0 {
+		return time.Now().UTC()
+	}
+	unixSec := (ft / 10_000_000) - 11_644_473_600
+	return time.Unix(unixSec, 0).UTC()
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-// Engine captures Windows toast notifications via WinEvent hooks.
-// It must be Run() which internally locks to an OS thread for hook affinity.
+// Engine polls the WPN SQLite database for new notifications.
 type Engine struct {
+	dbPath     string
 	intervalMs int
 	filterApps map[string]struct{}
 	ignoreApps map[string]struct{}
 	logger     *logrus.Logger
 	out        chan<- *Notification
-
-	mu   sync.Mutex
-	seen map[string]time.Time // dedup: content-key → last seen time
+	lastID     int64 // highest Notification.Id seen so far
 }
 
 func NewEngine(
@@ -108,182 +143,134 @@ func NewEngine(
 		ia[strings.ToLower(a)] = struct{}{}
 	}
 	return &Engine{
+		dbPath:     wpnDBPath(),
 		intervalMs: intervalMs,
 		filterApps: fa,
 		ignoreApps: ia,
 		logger:     log,
 		out:        out,
-		seen:       make(map[string]time.Time),
 	}
 }
 
-// Run locks an OS thread, installs WinEvent hooks, and pumps Win32 messages
-// until ctx is cancelled.
+// Run polls the WPN database until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
-	errCh := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		errCh <- e.messageLoop(ctx)
-	}()
-	return <-errCh
-}
-
-func (e *Engine) messageLoop(ctx context.Context) error {
-	tidRet, _, _ := procGetCurrentThreadId.Call()
-	threadID := uint32(tidRet)
-
-	// ── WinEvent hook: EVENT_SYSTEM_ALERT ────────────────────────────────
-	// Fires when a toast notification is shown (by any process).
-	cbAlert := windows.NewCallback(e.onWinEvent)
-	hAlert, _, _ := procSetWinEventHook.Call(
-		uintptr(EVENT_SYSTEM_ALERT), uintptr(EVENT_SYSTEM_ALERT),
-		0, cbAlert, 0, 0,
-		uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNTHREAD),
-	)
-	if hAlert == 0 {
-		return fmt.Errorf("SetWinEventHook(EVENT_SYSTEM_ALERT) returned NULL")
-	}
-	defer procUnhookWinEvent.Call(hAlert)
-
-	// ── WinEvent hook: EVENT_OBJECT_CREATE ───────────────────────────────
-	// Catches notification windows that don't emit SYSTEM_ALERT.
-	cbCreate := windows.NewCallback(e.onWinEvent)
-	hCreate, _, _ := procSetWinEventHook.Call(
-		uintptr(EVENT_OBJECT_CREATE), uintptr(EVENT_OBJECT_CREATE),
-		0, cbCreate, 0, 0,
-		uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNTHREAD),
-	)
-	if hCreate != 0 {
-		defer procUnhookWinEvent.Call(hCreate)
+	if _, err := os.Stat(e.dbPath); err != nil {
+		return fmt.Errorf("WPN database not found at %s: %w", e.dbPath, err)
 	}
 
-	e.logger.Infof("Capture engine started — WinEvent hooks active on thread %d", threadID)
+	// Seed lastID so we only forward notifications that arrive AFTER startup.
+	// Open a fresh connection just for seeding, then close it.
+	if err := e.seedLastID(ctx); err != nil {
+		e.logger.WithError(err).Warn("Could not seed lastID — will emit all existing notifications on first poll")
+	}
 
-	// Action Center poll runs concurrently on a regular goroutine (not hook-thread).
-	go func() {
-		t := time.NewTicker(time.Duration(e.intervalMs) * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				e.pollActionCenter()
+	e.logger.Infof("Capture engine started — polling %s every %dms (lastID=%d)", e.dbPath, e.intervalMs, e.lastID)
+
+	ticker := time.NewTicker(time.Duration(e.intervalMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			e.logger.Info("Capture engine stopped")
+			return nil
+		case <-ticker.C:
+			if err := e.poll(ctx); err != nil {
+				e.logger.WithError(err).Warn("Poll error")
 			}
 		}
-	}()
-
-	// Break the message loop when context is cancelled.
-	go func() {
-		<-ctx.Done()
-		procPostThreadMessageW.Call(uintptr(threadID), WM_QUIT, 0, 0)
-	}()
-
-	// Win32 message pump — keeps the hook alive.
-	var msg msgStruct
-	for {
-		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if r == 0 || r == ^uintptr(0) {
-			break // WM_QUIT or error
-		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 	}
+}
 
-	e.logger.Info("Capture engine stopped")
+// openDB opens a fresh read-only connection to the WPN database.
+// A new connection is opened on every poll so SQLite always reads the current
+// file from disk — immutable=1 or a persistent connection would cache the
+// file at open time and miss new rows written by the WPN service.
+func (e *Engine) openDB() (*sql.DB, error) {
+	// mode=ro  — read-only, never writes
+	// cache=shared — share page cache across connections
+	// No immutable=1 — we NEED to see changes written by Windows
+	// No _journal_mode — read-only connections cannot change journal mode
+	dsn := fmt.Sprintf("file:%s?mode=ro&cache=shared", e.dbPath)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
+}
+
+// seedLastID sets lastID to the current maximum rowid so we skip history.
+func (e *Engine) seedLastID(ctx context.Context) error {
+	db, err := e.openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var maxID sql.NullInt64
+	err = db.QueryRowContext(ctx, `SELECT MAX(Id) FROM Notification`).Scan(&maxID)
+	if err != nil {
+		return err
+	}
+	if maxID.Valid {
+		e.lastID = maxID.Int64
+	}
+	e.logger.Infof("Seeded lastID=%d (existing notifications will be skipped)", e.lastID)
 	return nil
 }
 
-// onWinEvent is the WinEvent hook callback.
-// Called on the hook thread for each EVENT_SYSTEM_ALERT / EVENT_OBJECT_CREATE.
-// Signature matches WINEVENTPROC: (hook, event, hwnd, idObject, idChild, thread, time)
-func (e *Engine) onWinEvent(hook, event uintptr, hwnd uintptr, idObject, idChild int32, eventThread, eventTime uint32) uintptr {
-	if hwnd == 0 {
-		return 0
+// poll opens a fresh DB connection, queries for rows newer than lastID, emits them.
+func (e *Engine) poll(ctx context.Context) error {
+	db, err := e.openDB()
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
 	}
+	defer db.Close()
 
-	className := winGetClassName(hwnd)
+	const query = `
+		SELECT n.Id, nh.PrimaryId, n.Payload, n.ArrivalTime
+		FROM Notification n
+		INNER JOIN NotificationHandler nh ON n.HandlerId = nh.RecordId
+		WHERE n.Id > ?
+		ORDER BY n.Id ASC`
 
-	// Toast popup window class names seen on Windows 10/11:
-	isToastWindow :=
-		strings.Contains(className, "Toast") ||
-			strings.EqualFold(className, "Windows.UI.Core.CoreWindow") ||
-			strings.Contains(className, "NativeHWNDHost") ||
-			strings.Contains(className, "XamlExplicitAnimationTrigger")
-
-	if !isToastWindow {
-		return 0
+	rows, err := db.QueryContext(ctx, query, e.lastID)
+	if err != nil {
+		return fmt.Errorf("query: %w", err)
 	}
+	defer rows.Close()
 
-	e.extractAndEmit(hwnd, "")
-	return 0
-}
-
-// pollActionCenter reads the currently open Action Center (notification flyout)
-// and emits unseen notifications. This catches pre-existing notifications and
-// apps that don't fire WinEvent hooks.
-func (e *Engine) pollActionCenter() {
-	hwnd := findNotificationWindow()
-	if hwnd == 0 {
-		return
-	}
-	e.extractAndEmit(hwnd, "ActionCenter")
-}
-
-// extractAndEmit reads all child window texts from hwnd, groups them into
-// notifications, and emits any that pass filter + dedup.
-func (e *Engine) extractAndEmit(hwnd uintptr, defaultApp string) {
-	texts := childWindowTexts(hwnd)
-	if len(texts) == 0 {
-		return
-	}
-
-	// Filter out UI chrome strings
-	chrome := map[string]bool{
-		"clear all": true, "notifications": true, "notification center": true,
-		"settings": true, "focus assist": true, "see all": true,
-	}
-
-	var clean []string
-	for _, t := range texts {
-		t = strings.TrimSpace(t)
-		if t == "" || chrome[strings.ToLower(t)] {
+	for rows.Next() {
+		var (
+			id          int64
+			primaryID   string
+			payload     []byte
+			arrivalTime int64
+		)
+		if err := rows.Scan(&id, &primaryID, &payload, &arrivalTime); err != nil {
+			e.logger.WithError(err).Warn("Row scan error")
 			continue
 		}
-		clean = append(clean, t)
-	}
-	if len(clean) == 0 {
-		return
-	}
 
-	appName := defaultApp
-	if appName == "" {
-		appName = winGetWindowText(hwnd)
-		if appName == "" {
-			appName = winGetClassName(hwnd)
+		if id > e.lastID {
+			e.lastID = id
 		}
-	}
 
-	// Heuristic grouping: treat first text as title, next as body.
-	// For the Action Center we may get many notifications; emit each pair.
-	for i := 0; i < len(clean); i++ {
-		title := clean[i]
-		body := ""
-		if i+1 < len(clean) {
-			body = clean[i+1]
-			i++ // consume body too
+		title, body := parsePayload(payload)
+		if title == "" {
+			continue
 		}
 
 		n := &Notification{
 			ID:        uuid.New().String(),
-			AppName:   appName,
+			AppName:   primaryID,
 			Title:     title,
 			Body:      body,
-			ArrivedAt: time.Now().UTC(),
+			ArrivedAt: filetimeToTime(arrivalTime),
 		}
 
-		if !e.shouldForward(n) || e.isDuplicate(n) {
+		if !e.shouldForward(n) {
 			continue
 		}
 
@@ -291,40 +278,14 @@ func (e *Engine) extractAndEmit(hwnd uintptr, defaultApp string) {
 		select {
 		case e.out <- n:
 		default:
-			e.logger.Warn("Output channel full, dropping: ", n.Title)
-		}
-	}
-}
-
-// ── De-duplication ────────────────────────────────────────────────────────────
-
-func dedupKey(n *Notification) string {
-	return strings.ToLower(n.Title) + "\x00" + strings.ToLower(n.Body)
-}
-
-func (e *Engine) isDuplicate(n *Notification) bool {
-	key := dedupKey(n)
-	now := time.Now()
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Prune stale entries (older than 60s)
-	for k, t := range e.seen {
-		if now.Sub(t) > 60*time.Second {
-			delete(e.seen, k)
+			e.logger.Warn("Channel full, dropping: ", n.Title)
 		}
 	}
 
-	if last, ok := e.seen[key]; ok && now.Sub(last) < 60*time.Second {
-		return true
-	}
-	e.seen[key] = now
-	return false
+	return rows.Err()
 }
 
-// ── Filter ────────────────────────────────────────────────────────────────────
-
+// shouldForward applies app filter/ignore rules.
 func (e *Engine) shouldForward(n *Notification) bool {
 	lower := strings.ToLower(n.AppName)
 	if _, ignored := e.ignoreApps[lower]; ignored {
@@ -337,88 +298,8 @@ func (e *Engine) shouldForward(n *Notification) bool {
 	return true
 }
 
-// ── Win32 helpers ─────────────────────────────────────────────────────────────
-
-func winGetWindowText(hwnd uintptr) string {
-	buf := make([]uint16, 512)
-	procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	return windows.UTF16ToString(buf)
-}
-
-func winGetClassName(hwnd uintptr) string {
-	buf := make([]uint16, 256)
-	procGetClassNameW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	return windows.UTF16ToString(buf)
-}
-
-// childWindowTexts enumerates all child windows of hwnd and returns their texts.
-func childWindowTexts(hwnd uintptr) []string {
-	var texts []string
-	var mu sync.Mutex
-
-	cb := windows.NewCallback(func(child, _ uintptr) uintptr {
-		// Only visible windows have meaningful text
-		vis, _, _ := procIsWindowVisible.Call(child)
-		if vis == 0 {
-			return 1
-		}
-		t := winGetWindowText(child)
-		if t != "" {
-			mu.Lock()
-			texts = append(texts, t)
-			mu.Unlock()
-		}
-		return 1 // continue
-	})
-
-	procEnumChildWindows.Call(hwnd, cb, 0)
-	return texts
-}
-
-// findNotificationWindow tries known window class/title pairs for the Action Center.
-func findNotificationWindow() uintptr {
-	type candidate struct{ class, title string }
-	candidates := []candidate{
-		// Windows 10
-		{"Windows.UI.Core.CoreWindow", "Notification Center"},
-		// Windows 11
-		{"TopLevelWindowForOverflowXamlIsland", ""},
-		{"ActionCenter", ""},
-		// Fallback
-		{"Shell_TrayWnd", ""},
-	}
-
-	for _, c := range candidates {
-		var classPtr, titlePtr *uint16
-		if c.class != "" {
-			p, _ := windows.UTF16PtrFromString(c.class)
-			classPtr = p
-		}
-		if c.title != "" {
-			p, _ := windows.UTF16PtrFromString(c.title)
-			titlePtr = p
-		}
-		hwnd, _, _ := procFindWindowW.Call(
-			ptrOrZero(classPtr),
-			ptrOrZero(titlePtr),
-		)
-		if hwnd != 0 {
-			return hwnd
-		}
-	}
-	return 0
-}
-
-func ptrOrZero(p *uint16) uintptr {
-	if p == nil {
-		return 0
-	}
-	return uintptr(unsafe.Pointer(p))
-}
-
-// RequestAccess is a no-op: the WinEvent hook approach needs no consent dialog.
-// Kept for --request-access CLI flag compatibility.
+// RequestAccess is a no-op — reading wpndatabase.db needs no special access.
 func RequestAccess(log *logrus.Logger) error {
-	log.Info("WinEvent hook engine needs no special access grant — you can run normally.")
+	log.Info("WPN database engine needs no special access grant.")
 	return nil
 }

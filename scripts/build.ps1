@@ -3,7 +3,7 @@
 #
 # Requirements:
 #   - Go 1.21+
-#   - CGO-capable toolchain (MinGW-w64 or MSVC) for ZeroMQ
+#   - CGO-capable toolchain (MinGW-w64) — required for go-sqlite3 AND ZeroMQ
 #   - Optional: goversioninfo for embedding version info in the .exe
 #
 # Usage:
