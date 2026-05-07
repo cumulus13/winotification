@@ -26,8 +26,10 @@ port = 23053
 password = ""
 # Application name shown in Growl
 app_name = "WiNotification"
-# Path to icon sent to Growl (PNG recommended)
-icon = "icons/icon.png"
+# Icon for Growl (PNG). Code auto-resizes to 64x64 max before sending via Binary mode.
+# Use a smaller source file for faster transfer — icon1.png (322KB) or icon.png (538KB).
+# The resize happens in-memory so the original file is unchanged.
+icon = "icons/icon1.png"
 
 # ─────────────────────────────────────────────────────────────
 # NTFY
@@ -102,7 +104,7 @@ params = ""
 # TOAST (Windows Toast Notification re-broadcast)
 # ─────────────────────────────────────────────────────────────
 [toast]
-enabled = true
+enabled = false
 # App ID shown in Action Center
 app_id = "WiNotification"
 # Duration: short, long
