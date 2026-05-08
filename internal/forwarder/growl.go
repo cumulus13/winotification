@@ -28,6 +28,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"encoding/json"
+	// "path/filepath"
 
 	gntp "github.com/cumulus13/go-gntp"
 	"github.com/cumulus13/WiNotification/internal/capture"
@@ -59,12 +61,14 @@ func NewGrowlForwarder(cfg config.GrowlConfig, log *logrus.Logger) (*GrowlForwar
 	// Load app icon — DataURL mode only, never Binary.
 	var appIcon *gntp.Resource
 	if cfg.Icon != "" {
-		res, err := gntp.LoadResource(cfg.Icon)
+		appIcon, err := gntp.LoadResource(cfg.Icon)
 		if err != nil {
 			log.WithError(err).Warnf("[growl] icon %q not found — sending without icon", cfg.Icon)
 		} else {
-			appIcon = res
-			client.WithIcon(appIcon)
+			// appIcon = res
+			// client.WithIcon(appIcon)
+			// fmt.Printf("✓ Icon loaded successfully (%d bytes)\n\n", len(appIcon.Data))
+			log.Infof("✓ Icon loaded successfully (%d bytes)\n\n", len(appIcon.Data))
 		}
 	}
 
@@ -96,7 +100,12 @@ func (g *GrowlForwarder) Forward(_ context.Context, n *capture.Notification) err
 	if title == "" {
 		title = n.AppName
 	}
-
+	if data, err := json.Marshal(n); err == nil {
+		fmt.Printf("n = %s\n", data)
+	} else {
+		fmt.Println("error:", err)
+	}
+	
 	// Per-notification icon — use DataURL mode (client already set to DataURL).
 	// NotifyWithOptions with an icon resource in DataURL mode uses sendPacket
 	// (not sendPacketWithResources), so no binary framing issues.

@@ -271,6 +271,7 @@ func makeNotification(appName, title, body string, seq uint32) *capture.Notifica
 		Group:     "test",
 		Sequence:  seq,
 		ArrivedAt: time.Now().UTC(),
+		// IconData: "icons/icon.png",
 	}
 }
 
