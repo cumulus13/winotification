@@ -24,12 +24,29 @@ package forwarder
 //   client.SendMessage(*Message) → error  (auto-registers if needed)
 //   client.Close() → error
 
+//   README says Binary is recommended for Windows Growl.
+//   README also says DataURL "may have issues with large icons on Windows".
+//   The word "large" is the key — a resized 64×64 PNG is ~3-5KB.
+//   As base64 DataURL that is ~4-7KB — not large at all.
+//   Binary mode keeps timing out regardless of timeout value, meaning the
+//   sendPacketWithResources framing does not work with this Growl version.
+//   DataURL with a small resized icon works perfectly — no timeout, icon shows.
+//
+//   FINAL DECISION: IconModeDataURL + resize icon to 64×64 before sending.
+
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/png"
+	_ "image/jpeg"
+	"os"
 	"time"
 	"encoding/json"
-	// "path/filepath"
+
+	_ "golang.org/x/image/bmp"
+	xdraw "golang.org/x/image/draw"
 
 	gntp "github.com/cumulus13/go-gntp"
 	"github.com/cumulus13/WiNotification/internal/capture"
@@ -37,7 +54,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// GrowlForwarder sends notifications to a Growl/Snarl server via GNTP.
+const maxIconSize = 64
+
 type GrowlForwarder struct {
 	cfg    config.GrowlConfig
 	log    *logrus.Logger
@@ -56,14 +74,14 @@ func NewGrowlForwarder(cfg config.GrowlConfig, log *logrus.Logger) (*GrowlForwar
 		WithHost(cfg.Host).
 		WithPort(cfg.Port).
 		WithIconMode(gntp.IconModeDataURL).
-		WithTimeout(5 * time.Second)
+		WithTimeout(10 * time.Second)
 
 	// Load app icon — DataURL mode only, never Binary.
 	var appIcon *gntp.Resource
 	if cfg.Icon != "" {
 		appIcon, err := gntp.LoadResource(cfg.Icon)
 		if err != nil {
-			log.WithError(err).Warnf("[growl] icon %q not found — sending without icon", cfg.Icon)
+			log.WithError(err).Warnf("[growl] icon %q load failed — sending without icon", cfg.Icon)
 		} else {
 			// appIcon = res
 			// client.WithIcon(appIcon)
@@ -89,7 +107,7 @@ func NewGrowlForwarder(cfg config.GrowlConfig, log *logrus.Logger) (*GrowlForwar
 		return nil, fmt.Errorf("growl register at %s:%d: %w", cfg.Host, cfg.Port, err)
 	}
 
-	log.Infof("[growl] registered '%s' with %s:%d (DataURL mode)", cfg.AppName, cfg.Host, cfg.Port)
+	log.Infof("[growl] registered '%s' with %s:%d (DataURL + 64px icon)", cfg.AppName, cfg.Host, cfg.Port)
 	return &GrowlForwarder{cfg: cfg, log: log, client: client}, nil
 }
 
@@ -110,7 +128,11 @@ func (g *GrowlForwarder) Forward(_ context.Context, n *capture.Notification) err
 	// NotifyWithOptions with an icon resource in DataURL mode uses sendPacket
 	// (not sendPacketWithResources), so no binary framing issues.
 	if len(n.IconData) > 0 {
-		res := gntp.LoadResourceFromBytes(n.IconData, "image/png")
+		small, err := resizeToSmall(n.IconData)
+		if err != nil {
+			small = n.IconData
+		}
+		res := gntp.LoadResourceFromBytes(small, "image/png")
 		opts := gntp.NewNotifyOptions().WithIcon(res)
 		return g.client.NotifyWithOptions("alert", title, n.Body, opts)
 	}
@@ -118,6 +140,60 @@ func (g *GrowlForwarder) Forward(_ context.Context, n *capture.Notification) err
 	return g.client.Notify("alert", title, n.Body)
 }
 
-func (g *GrowlForwarder) Close() error {
-	return g.client.Close()
+func (g *GrowlForwarder) Close() error { return g.client.Close() }
+
+// loadSmallIcon reads path, decodes, resizes to ≤64×64, returns as gntp.Resource.
+func loadSmallIcon(path string, log *logrus.Logger) (*gntp.Resource, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	small, err := resizeToSmall(data)
+	if err != nil {
+		log.Warnf("[growl] resize failed (%v) — using raw bytes", err)
+		return gntp.LoadResourceFromBytes(data, "image/png"), nil
+	}
+	return gntp.LoadResourceFromBytes(small, "image/png"), nil
+}
+
+// resizeToSmall decodes any supported image and encodes it as a ≤64×64 PNG.
+func resizeToSmall(data []byte) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	w := src.Bounds().Dx()
+	h := src.Bounds().Dy()
+
+	if w <= maxIconSize && h <= maxIconSize {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, src); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
+	scale := float64(maxIconSize) / float64(w)
+	if s := float64(maxIconSize) / float64(h); s < scale {
+		scale = s
+	}
+	nw := max1(int(float64(w)*scale))
+	nh := max1(int(float64(h)*scale))
+
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, dst); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func max1(v int) int {
+	if v < 1 {
+		return 1
+	}
+	return v
 }

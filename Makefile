@@ -2,14 +2,18 @@
 # Author: Hadi Cahyadi <cumulus13@gmail.com>
 # Note: this is for cross-compile or MinGW shells on Windows.
 
-BINARY      = dist/WiNotification.exe
-TEST_BINARY = dist/winotif-test.exe
-PKG         = ./cmd/winotification
-TEST_PKG    = ./cmd/winotif-test
-LDFLAGS     = -H windowsgui -s -w
-TAGS        = windows
+BINARY       = dist/WiNotification.exe
+TEST_BINARY  = dist/winotif-test.exe
+INSPECT_BINARY = dist/wpn-inspect.exe
+PKG          = ./cmd/winotification
+TEST_PKG     = ./cmd/winotif-test
+INSPECT_PKG  = ./cmd/wpn-inspect
+LDFLAGS      = -H windowsgui -s -w
+TAGS         = windows
 
-.PHONY: build release test-cli clean tidy deps
+.PHONY: build release test-cli inspect clean tidy deps all
+
+all: build test-cli inspect
 
 build: _dist
 	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
@@ -27,8 +31,11 @@ test-cli: _dist
 		go build -tags $(TAGS) -o $(TEST_BINARY) $(TEST_PKG)
 	@echo "Test CLI OK => $(TEST_BINARY)"
 
-# Build both in one shot
-all: build test-cli
+# wpn-inspect: diagnose the real wpndatabase.db schema on your system
+inspect: _dist
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
+		go build -tags $(TAGS) -o $(INSPECT_BINARY) $(INSPECT_PKG)
+	@echo "Inspect tool OK => $(INSPECT_BINARY)"
 
 _dist:
 	@mkdir -p dist

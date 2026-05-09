@@ -1,32 +1,33 @@
 //go:build windows
 
-// Package capture reads Windows notifications from the WPN (Windows Push
-// Notification) SQLite database — the only approach that reliably works from
-// a plain unpackaged Win32 exe without any special permissions.
+// Package capture polls the Windows Push Notification database (wpndatabase.db)
+// for new toast notifications and emits them as Notification structs.
 //
-// Database location (per-user):
-//   %LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db
+// Schema (confirmed from wpn-inspect output on your system):
 //
-// Schema (confirmed from forensic research and direct observation):
 //   Notification table:
-//     Id          INTEGER  — unique row ID, monotonically increasing
-//     HandlerId   INTEGER  — FK → NotificationHandler.RecordId
-//     Payload     BLOB     — XML content of the notification
-//     ArrivalTime INTEGER  — Windows FILETIME (100ns ticks since 1601-01-01)
-//     ExpiryTime  INTEGER  — expiry in same format
-//     Type        INTEGER  — notification type
+//     [0] Order       INTEGER  PRIMARY KEY  ← monotonic rowid — use this for tracking
+//     [1] Id          INTEGER               ← NOT the PK, do not use for WHERE >
+//     [2] HandlerId   INTEGER               ← FK → NotificationHandler.RecordId
+//     [3] Type        TEXT                  ← "toast" has payload; "toastCondensed" = NULL payload
+//     [4] Payload     BLOB                  ← XML, NULL for toastCondensed rows
+//     [5] ArrivalTime INT64                 ← Windows FILETIME
 //
 //   NotificationHandler table:
-//     RecordId    INTEGER  — PK
-//     PrimaryId   TEXT     — app identifier (e.g. "Microsoft.Teams_...")
+//     RecordId   INTEGER PRIMARY KEY
+//     PrimaryId  TEXT    ← app name (e.g. "DTOP", "MailClient", "go-gitdate")
 //
-// Strategy:
-//   Poll the DB every intervalMs. Track the highest Id seen.
-//   On each poll, SELECT rows with Id > lastSeen, parse XML payload,
-//   emit as Notification. No hooks, no COM, no UWP, no permissions needed.
-//
-// The DB is opened with mode=ro&_journal_mode=WAL so we don't interfere with
-// the live WPN service writing to it.
+// Toast XML structure (from real data):
+//   <toast>
+//     <visual>
+//       <binding template="ToastGeneric">
+//         <text>Title line</text>
+//         <text>Body line</text>
+//         <text placement="attribution">Attribution — SKIP</text>
+//         <image placement="appLogoOverride" src="file:///C:\path\to\icon.png"/>
+//       </binding>
+//     </visual>
+//   </toast>
 //
 // Author:   Hadi Cahyadi <cumulus13@gmail.com>
 // Homepage: github.com/cumulus13/WiNotification
@@ -52,7 +53,6 @@ import (
 func wpnDBPath() string {
 	local := os.Getenv("LOCALAPPDATA")
 	if local == "" {
-		// Fallback: construct from USERPROFILE
 		local = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
 	}
 	return filepath.Join(local, "Microsoft", "Windows", "Notifications", "wpndatabase.db")
@@ -60,63 +60,104 @@ func wpnDBPath() string {
 
 // ── Toast XML parsing ─────────────────────────────────────────────────────────
 
-// toastXML mirrors the structure of Windows toast notification XML payloads.
-type toastXML struct {
-	Visual struct {
-		Binding struct {
-			Texts []struct {
-				Value string `xml:",chardata"`
-			} `xml:"text"`
-		} `xml:"binding"`
-	} `xml:"visual"`
+// xmlToast mirrors the Windows toast XML structure seen in real wpndatabase rows.
+type xmlToast struct {
+	XMLName xml.Name    `xml:"toast"`
+	Visual  xmlVisual   `xml:"visual"`
 }
 
-// parsePayload extracts title and body from a Windows notification XML payload.
-// The payload is a BLOB that may be raw bytes or a UTF-8 XML string.
-func parsePayload(payload []byte) (title, body string) {
+type xmlVisual struct {
+	Binding xmlBinding `xml:"binding"`
+}
+
+type xmlBinding struct {
+	Texts  []xmlText  `xml:"text"`
+	Images []xmlImage `xml:"image"`
+}
+
+type xmlText struct {
+	Placement string `xml:"placement,attr"`
+	Value     string `xml:",chardata"`
+}
+
+type xmlImage struct {
+	Placement string `xml:"placement,attr"`
+	HintCrop  string `xml:"hint-crop,attr"`
+	Src       string `xml:"src,attr"`
+}
+
+// parseToast extracts title, body, and icon path from a Windows toast XML payload.
+//
+// Text rules (from real data):
+//   - Texts without placement="attribution" in order: first=title, second=body
+//   - Texts with placement="attribution" are skipped (e.g. email account name)
+//
+// Icon rules (from real data):
+//   - <image placement="appLogoOverride" src="file:///C:\path\to\icon.png"/>
+//   - src may be a file:// URI or http:// URL
+//   - Strip "file:///" prefix to get local path
+func parseToast(payload []byte) (title, body, iconPath string) {
 	if len(payload) == 0 {
-		return "", ""
+		return
 	}
 
-	var toast toastXML
+	var toast xmlToast
 	if err := xml.Unmarshal(payload, &toast); err != nil {
-		// Payload may not be valid XML (tile/badge types) — return raw trimmed.
-		s := strings.TrimSpace(string(payload))
-		if len(s) > 200 {
-			s = s[:200]
+		// Not valid XML — treat raw bytes as title
+		title = strings.TrimSpace(string(payload))
+		if len(title) > 200 {
+			title = title[:200]
 		}
-		return s, ""
+		return
 	}
 
-	texts := toast.Visual.Binding.Texts
-	if len(texts) == 0 {
-		return "", ""
-	}
-	title = strings.TrimSpace(texts[0].Value)
-	var parts []string
-	for _, t := range texts[1:] {
+	// Extract non-attribution text lines in order
+	var lines []string
+	for _, t := range toast.Visual.Binding.Texts {
+		if strings.EqualFold(t.Placement, "attribution") {
+			continue // skip attribution text
+		}
 		v := strings.TrimSpace(t.Value)
 		if v != "" {
-			parts = append(parts, v)
+			lines = append(lines, v)
 		}
 	}
-	body = strings.Join(parts, "\n")
+
+	if len(lines) > 0 {
+		title = lines[0]
+	}
+	if len(lines) > 1 {
+		body = strings.Join(lines[1:], "\n")
+	}
+
+	// Extract icon from appLogoOverride image
+	for _, img := range toast.Visual.Binding.Images {
+		if strings.EqualFold(img.Placement, "appLogoOverride") && img.Src != "" {
+			src := img.Src
+			// Strip file:/// prefix → local Windows path
+			if strings.HasPrefix(src, "file:///") {
+				src = strings.TrimPrefix(src, "file:///")
+				src = strings.ReplaceAll(src, "/", `\`)
+			}
+			iconPath = src
+			break
+		}
+	}
+
 	return
 }
 
-// filetimeToTime converts a Windows FILETIME integer to time.Time.
-// Formula: unix_seconds = (filetime / 10_000_000) - 11_644_473_600
+// filetimeToTime converts a Windows FILETIME (100ns ticks since 1601-01-01) to time.Time.
 func filetimeToTime(ft int64) time.Time {
 	if ft == 0 {
 		return time.Now().UTC()
 	}
-	unixSec := (ft / 10_000_000) - 11_644_473_600
-	return time.Unix(unixSec, 0).UTC()
+	return time.Unix((ft/10_000_000)-11_644_473_600, 0).UTC()
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-// Engine polls the WPN SQLite database for new notifications.
+// Engine polls wpndatabase.db for new toast notifications.
 type Engine struct {
 	dbPath     string
 	intervalMs int
@@ -124,7 +165,7 @@ type Engine struct {
 	ignoreApps map[string]struct{}
 	logger     *logrus.Logger
 	out        chan<- *Notification
-	lastID     int64 // highest Notification.Id seen so far
+	lastOrder  int64 // tracks highest `Order` value seen — Order is the true PK
 }
 
 func NewEngine(
@@ -158,13 +199,12 @@ func (e *Engine) Run(ctx context.Context) error {
 		return fmt.Errorf("WPN database not found at %s: %w", e.dbPath, err)
 	}
 
-	// Seed lastID so we only forward notifications that arrive AFTER startup.
-	// Open a fresh connection just for seeding, then close it.
-	if err := e.seedLastID(ctx); err != nil {
-		e.logger.WithError(err).Warn("Could not seed lastID — will emit all existing notifications on first poll")
+	if err := e.seedLastOrder(ctx); err != nil {
+		e.logger.WithError(err).Warn("Could not seed lastOrder — will emit all existing notifications on first poll")
 	}
 
-	e.logger.Infof("Capture engine started — polling %s every %dms (lastID=%d)", e.dbPath, e.intervalMs, e.lastID)
+	e.logger.Infof("Capture engine started — polling %s every %dms (lastOrder=%d)",
+		e.dbPath, e.intervalMs, e.lastOrder)
 
 	ticker := time.NewTicker(time.Duration(e.intervalMs) * time.Millisecond)
 	defer ticker.Stop()
@@ -182,15 +222,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
-// openDB opens a fresh read-only connection to the WPN database.
-// A new connection is opened on every poll so SQLite always reads the current
-// file from disk — immutable=1 or a persistent connection would cache the
-// file at open time and miss new rows written by the WPN service.
+// openDB opens a fresh read-only connection. Fresh per poll so SQLite
+// always reads current file state — persistent connection caches stale data.
 func (e *Engine) openDB() (*sql.DB, error) {
-	// mode=ro  — read-only, never writes
-	// cache=shared — share page cache across connections
-	// No immutable=1 — we NEED to see changes written by Windows
-	// No _journal_mode — read-only connections cannot change journal mode
 	dsn := fmt.Sprintf("file:%s?mode=ro&cache=shared", e.dbPath)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -200,27 +234,26 @@ func (e *Engine) openDB() (*sql.DB, error) {
 	return db, nil
 }
 
-// seedLastID sets lastID to the current maximum rowid so we skip history.
-func (e *Engine) seedLastID(ctx context.Context) error {
+// seedLastOrder sets lastOrder to current MAX([Order]) so we skip history.
+func (e *Engine) seedLastOrder(ctx context.Context) error {
 	db, err := e.openDB()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	var maxID sql.NullInt64
-	err = db.QueryRowContext(ctx, `SELECT MAX(Id) FROM Notification`).Scan(&maxID)
-	if err != nil {
+	var maxOrder sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX("Order") FROM Notification`).Scan(&maxOrder); err != nil {
 		return err
 	}
-	if maxID.Valid {
-		e.lastID = maxID.Int64
+	if maxOrder.Valid {
+		e.lastOrder = maxOrder.Int64
 	}
-	e.logger.Infof("Seeded lastID=%d (existing notifications will be skipped)", e.lastID)
+	e.logger.Infof("Seeded lastOrder=%d (existing notifications skipped)", e.lastOrder)
 	return nil
 }
 
-// poll opens a fresh DB connection, queries for rows newer than lastID, emits them.
+// poll queries for rows with Order > lastOrder, type='toast', non-NULL payload.
 func (e *Engine) poll(ctx context.Context) error {
 	db, err := e.openDB()
 	if err != nil {
@@ -228,14 +261,18 @@ func (e *Engine) poll(ctx context.Context) error {
 	}
 	defer db.Close()
 
+	// Only select toast rows (not toastCondensed) with non-NULL Payload.
+	// Use `Order` (the true PRIMARY KEY) for tracking, not `Id`.
 	const query = `
-		SELECT n.Id, nh.PrimaryId, n.Payload, n.ArrivalTime
+		SELECT n."Order", nh.PrimaryId, n.Payload, n.ArrivalTime
 		FROM Notification n
 		INNER JOIN NotificationHandler nh ON n.HandlerId = nh.RecordId
-		WHERE n.Id > ?
-		ORDER BY n.Id ASC`
+		WHERE n."Order" > ?
+		  AND n.Type = 'toast'
+		  AND n.Payload IS NOT NULL
+		ORDER BY n."Order" ASC`
 
-	rows, err := db.QueryContext(ctx, query, e.lastID)
+	rows, err := db.QueryContext(ctx, query, e.lastOrder)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -243,23 +280,33 @@ func (e *Engine) poll(ctx context.Context) error {
 
 	for rows.Next() {
 		var (
-			id          int64
+			order       int64
 			primaryID   string
 			payload     []byte
 			arrivalTime int64
 		)
-		if err := rows.Scan(&id, &primaryID, &payload, &arrivalTime); err != nil {
-			e.logger.WithError(err).Warn("Row scan error")
+		if err := rows.Scan(&order, &primaryID, &payload, &arrivalTime); err != nil {
+			e.logger.WithError(err).Warn("Scan error")
 			continue
 		}
 
-		if id > e.lastID {
-			e.lastID = id
+		if order > e.lastOrder {
+			e.lastOrder = order
 		}
 
-		title, body := parsePayload(payload)
+		title, body, iconPath := parseToast(payload)
 		if title == "" {
 			continue
+		}
+
+		// Load icon bytes from local file path if present
+		var iconData []byte
+		if iconPath != "" {
+			if data, err := os.ReadFile(iconPath); err == nil {
+				iconData = data
+			} else {
+				e.logger.Debugf("Icon not readable at %s: %v", iconPath, err)
+			}
 		}
 
 		n := &Notification{
@@ -268,13 +315,14 @@ func (e *Engine) poll(ctx context.Context) error {
 			Title:     title,
 			Body:      body,
 			ArrivedAt: filetimeToTime(arrivalTime),
+			IconData:  iconData,
 		}
 
 		if !e.shouldForward(n) {
 			continue
 		}
 
-		e.logger.Infof("Captured [%s] %q — %q", n.AppName, n.Title, n.Body)
+		e.logger.Infof("Captured [%s] %q — %q (icon=%v)", n.AppName, n.Title, n.Body, iconPath != "")
 		select {
 		case e.out <- n:
 		default:
@@ -285,7 +333,6 @@ func (e *Engine) poll(ctx context.Context) error {
 	return rows.Err()
 }
 
-// shouldForward applies app filter/ignore rules.
 func (e *Engine) shouldForward(n *Notification) bool {
 	lower := strings.ToLower(n.AppName)
 	if _, ignored := e.ignoreApps[lower]; ignored {
@@ -298,7 +345,7 @@ func (e *Engine) shouldForward(n *Notification) bool {
 	return true
 }
 
-// RequestAccess is a no-op — reading wpndatabase.db needs no special access.
+// RequestAccess is a no-op for this engine.
 func RequestAccess(log *logrus.Logger) error {
 	log.Info("WPN database engine needs no special access grant.")
 	return nil
