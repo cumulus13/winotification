@@ -33,3 +33,18 @@ example*.png
 icons/ChatGPT Image Apr 29
 2026
 08_46_11 PM.png
+
+# Added entries (1 items)
+.pt/
+
+# Added entries (1 items)
+*.off
+
+# Added entries (1 items)
+ANSWER_ADD_TABLE.md
+
+# Added entries (1 items)
+config.display.example.toml
+
+# Added entries (1 items)
+config.toml

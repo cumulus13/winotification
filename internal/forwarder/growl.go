@@ -43,7 +43,7 @@ import (
 	_ "image/jpeg"
 	"os"
 	"time"
-	"encoding/json"
+	// "encoding/json"
 
 	_ "golang.org/x/image/bmp"
 	xdraw "golang.org/x/image/draw"
@@ -118,11 +118,11 @@ func (g *GrowlForwarder) Forward(_ context.Context, n *capture.Notification) err
 	if title == "" {
 		title = n.AppName
 	}
-	if data, err := json.Marshal(n); err == nil {
-		fmt.Printf("n = %s\n", data)
-	} else {
-		fmt.Println("error:", err)
-	}
+	// if data, err := json.Marshal(n); err == nil {
+	// 	fmt.Printf("n = %s\n", data)
+	// } else {
+	// 	fmt.Println("error:", err)
+	// }
 	
 	// Per-notification icon — use DataURL mode (client already set to DataURL).
 	// NotifyWithOptions with an icon resource in DataURL mode uses sendPacket

@@ -21,6 +21,8 @@ import (
 	"github.com/cumulus13/WiNotification/internal/forwarder"
 	applogger "github.com/cumulus13/WiNotification/internal/logger"
 	appsystray "github.com/cumulus13/WiNotification/internal/systray"
+
+	"github.com/cumulus13/WiNotification/internal/tableprint"
 )
 
 const version = "1.0.0"
@@ -61,6 +63,10 @@ func main() {
 	// connect inline with their own short timeouts (Redis 5s, etc.).
 	dispatcher := forwarder.NewDispatcher(log)
 	defer dispatcher.Close()
+
+	// Table output for captured notifications (stdout).
+	tablePrinter := tableprint.NewPrinter(cfg.Table)
+	defer tablePrinter.Close()
 
 	// Add all non-blocking forwarders immediately
 	if cfg.Ntfy.Enabled {
@@ -178,6 +184,7 @@ func main() {
 					continue
 				}
 				log.Infof("Captured [%s] %s: %s", n.AppName, n.Title, n.Body)
+				tablePrinter.Print(n)
 				dispatcher.Dispatch(ctx, n)
 			}
 		}

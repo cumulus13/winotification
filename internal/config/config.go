@@ -19,6 +19,7 @@ type Config struct {
 	Redis    RedisConfig    `mapstructure:"redis"`
 	Database DatabaseConfig `mapstructure:"database"`
 	Toast    ToastConfig    `mapstructure:"toast"`
+	Table    TableConfig    `mapstructure:"table"`
 }
 
 type GeneralConfig struct {
@@ -92,6 +93,29 @@ type ToastConfig struct {
 	AppID    string `mapstructure:"app_id"`
 	Duration string `mapstructure:"duration"`
 	Audio    string `mapstructure:"audio"`
+}
+
+// TableColumnConfig configures one column of the captured-notification table.
+//
+//   max_width: hard cap on the column width in characters.
+//              0 means "auto" — only meaningful for the "body" column, which
+//              absorbs whatever terminal width is left after the other
+//              columns and borders.
+//   color:     hex color (e.g. "#FFFF00") applied to this column's values.
+//              Leave empty for no color.
+type TableColumnConfig struct {
+	MaxWidth int    `mapstructure:"max_width"`
+	Color    string `mapstructure:"color"`
+}
+
+// TableConfig configures the captured-notification table printed to stdout.
+type TableConfig struct {
+	Enabled     bool                          `mapstructure:"enabled"`
+	HeaderEvery int                           `mapstructure:"header_every"`
+	NoColor     bool                          `mapstructure:"no_color"`
+	BorderColor string                        `mapstructure:"border_color"`
+	HeaderColor string                        `mapstructure:"header_color"`
+	Columns     map[string]TableColumnConfig `mapstructure:"columns"`
 }
 
 var current *Config
@@ -176,4 +200,29 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("toast.app_id", "WiNotification")
 	v.SetDefault("toast.duration", "short")
 	v.SetDefault("toast.audio", "ms-winsoundevent:Notification.Default")
+
+	// ── Table output ──────────────────────────────────────────
+	v.SetDefault("table.enabled", true)
+	v.SetDefault("table.header_every", 20) // re-print header every N rows; 0 = once
+	v.SetDefault("table.no_color", false)
+	v.SetDefault("table.border_color", "#808080")
+	v.SetDefault("table.header_color", "#FFFFFF")
+
+	v.SetDefault("table.columns.time.max_width", 8)
+	v.SetDefault("table.columns.time.color", "#808080")
+
+	v.SetDefault("table.columns.app.max_width", 18)
+	v.SetDefault("table.columns.app.color", "#00FFFF")
+
+	v.SetDefault("table.columns.title.max_width", 24)
+	v.SetDefault("table.columns.title.color", "#FFFF00")
+
+	v.SetDefault("table.columns.body.max_width", 0) // 0 = auto-fill remaining width
+	v.SetDefault("table.columns.body.color", "#FFFFFF")
+
+	v.SetDefault("table.columns.tag.max_width", 10)
+	v.SetDefault("table.columns.tag.color", "#FF00FF")
+
+	v.SetDefault("table.columns.group.max_width", 10)
+	v.SetDefault("table.columns.group.color", "#00FF00")
 }
