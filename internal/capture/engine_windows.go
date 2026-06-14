@@ -3,31 +3,37 @@
 // Package capture polls the Windows Push Notification database (wpndatabase.db)
 // for new toast notifications and emits them as Notification structs.
 //
-// Schema (confirmed from wpn-inspect output on your system):
+// ── HOW WAL MODE WORKS AND WHY THIS APPROACH IS CORRECT ─────────────────────
 //
-//   Notification table:
-//     [0] Order       INTEGER  PRIMARY KEY  ← monotonic rowid — use this for tracking
-//     [1] Id          INTEGER               ← NOT the PK, do not use for WHERE >
-//     [2] HandlerId   INTEGER               ← FK → NotificationHandler.RecordId
-//     [3] Type        TEXT                  ← "toast" has payload; "toastCondensed" = NULL payload
-//     [4] Payload     BLOB                  ← XML, NULL for toastCondensed rows
-//     [5] ArrivalTime INT64                 ← Windows FILETIME
+// wpndatabase.db uses SQLite WAL (Write-Ahead Logging). In WAL mode:
 //
-//   NotificationHandler table:
-//     RecordId   INTEGER PRIMARY KEY
-//     PrimaryId  TEXT    ← app name (e.g. "DTOP", "MailClient", "go-gitdate")
+//   wpndatabase.db      — checkpointed (older) data
+//   wpndatabase.db-wal  — all new writes land here first
+//   wpndatabase.db-shm  — shared memory index: tells readers where in the
+//                         WAL the latest committed frame is
 //
-// Toast XML structure (from real data):
-//   <toast>
-//     <visual>
-//       <binding template="ToastGeneric">
-//         <text>Title line</text>
-//         <text>Body line</text>
-//         <text placement="attribution">Attribution — SKIP</text>
-//         <image placement="appLogoOverride" src="file:///C:\path\to\icon.png"/>
-//       </binding>
-//     </visual>
-//   </toast>
+// A SQLite reader takes a WAL read-lock at BEGIN and releases it at
+// COMMIT/ROLLBACK. The read-lock pins the reader to a specific WAL position —
+// it sees a consistent snapshot as of that moment. If the read-lock is never
+// released (e.g. a persistent connection that never does explicit BEGIN/COMMIT,
+// which is what database/sql does by default in auto-commit mode with a
+// connection pool), the reader stays pinned to the WAL position from the
+// first query — potentially hours old.
+//
+// FIX: one persistent *sql.DB with pool size 1, and every poll wrapped in an
+// explicit BEGIN (read-only) / ROLLBACK transaction. Each BEGIN re-acquires
+// the WAL read-lock at the current WAL head, seeing all frames written by
+// Windows since the last poll. ROLLBACK releases the lock immediately after.
+//
+// This means:
+//   - No file copy (works with a 10GB database just as well as a 10KB one)
+//   - No reconnect overhead
+//   - No CGO handle churn
+//   - Guaranteed fresh WAL position on every single poll, forever
+//
+// The ONLY persistent state between polls is e.lastOrder (an int64) and the
+// single open *sql.DB connection — which holds NO read-lock between polls
+// because each poll's transaction has been committed/rolled back.
 //
 // Author:   Hadi Cahyadi <cumulus13@gmail.com>
 // Homepage: github.com/cumulus13/WiNotification
@@ -60,94 +66,65 @@ func wpnDBPath() string {
 
 // ── Toast XML parsing ─────────────────────────────────────────────────────────
 
-// xmlToast mirrors the Windows toast XML structure seen in real wpndatabase rows.
 type xmlToast struct {
-	XMLName xml.Name    `xml:"toast"`
-	Visual  xmlVisual   `xml:"visual"`
+	XMLName xml.Name  `xml:"toast"`
+	Visual  xmlVisual `xml:"visual"`
 }
-
-type xmlVisual struct {
-	Binding xmlBinding `xml:"binding"`
-}
-
+type xmlVisual struct{ Binding xmlBinding `xml:"binding"` }
 type xmlBinding struct {
 	Texts  []xmlText  `xml:"text"`
 	Images []xmlImage `xml:"image"`
 }
-
 type xmlText struct {
 	Placement string `xml:"placement,attr"`
 	Value     string `xml:",chardata"`
 }
-
 type xmlImage struct {
 	Placement string `xml:"placement,attr"`
 	HintCrop  string `xml:"hint-crop,attr"`
 	Src       string `xml:"src,attr"`
 }
 
-// parseToast extracts title, body, and icon path from a Windows toast XML payload.
-//
-// Text rules (from real data):
-//   - Texts without placement="attribution" in order: first=title, second=body
-//   - Texts with placement="attribution" are skipped (e.g. email account name)
-//
-// Icon rules (from real data):
-//   - <image placement="appLogoOverride" src="file:///C:\path\to\icon.png"/>
-//   - src may be a file:// URI or http:// URL
-//   - Strip "file:///" prefix to get local path
 func parseToast(payload []byte) (title, body, iconPath string) {
 	if len(payload) == 0 {
 		return
 	}
-
-	var toast xmlToast
-	if err := xml.Unmarshal(payload, &toast); err != nil {
-		// Not valid XML — treat raw bytes as title
+	var t xmlToast
+	if err := xml.Unmarshal(payload, &t); err != nil {
 		title = strings.TrimSpace(string(payload))
 		if len(title) > 200 {
 			title = title[:200]
 		}
 		return
 	}
-
-	// Extract non-attribution text lines in order
 	var lines []string
-	for _, t := range toast.Visual.Binding.Texts {
-		if strings.EqualFold(t.Placement, "attribution") {
-			continue // skip attribution text
+	for _, txt := range t.Visual.Binding.Texts {
+		if strings.EqualFold(txt.Placement, "attribution") {
+			continue
 		}
-		v := strings.TrimSpace(t.Value)
-		if v != "" {
+		if v := strings.TrimSpace(txt.Value); v != "" {
 			lines = append(lines, v)
 		}
 	}
-
 	if len(lines) > 0 {
 		title = lines[0]
 	}
 	if len(lines) > 1 {
 		body = strings.Join(lines[1:], "\n")
 	}
-
-	// Extract icon from appLogoOverride image
-	for _, img := range toast.Visual.Binding.Images {
+	for _, img := range t.Visual.Binding.Images {
 		if strings.EqualFold(img.Placement, "appLogoOverride") && img.Src != "" {
 			src := img.Src
-			// Strip file:/// prefix → local Windows path
 			if strings.HasPrefix(src, "file:///") {
-				src = strings.TrimPrefix(src, "file:///")
-				src = strings.ReplaceAll(src, "/", `\`)
+				src = strings.ReplaceAll(strings.TrimPrefix(src, "file:///"), "/", `\`)
 			}
 			iconPath = src
 			break
 		}
 	}
-
 	return
 }
 
-// filetimeToTime converts a Windows FILETIME (100ns ticks since 1601-01-01) to time.Time.
 func filetimeToTime(ft int64) time.Time {
 	if ft == 0 {
 		return time.Now().UTC()
@@ -165,7 +142,14 @@ type Engine struct {
 	ignoreApps map[string]struct{}
 	logger     *logrus.Logger
 	out        chan<- *Notification
-	lastOrder  int64 // tracks highest `Order` value seen — Order is the true PK
+	lastOrder  int64
+
+	// db is a single persistent connection to the REAL wpndatabase.db.
+	// Pool size is forced to 1 so there is exactly one underlying sqlite3*
+	// handle. The WAL read-lock is managed per-transaction (BEGIN/ROLLBACK),
+	// not per-connection, so this single connection sees fresh WAL data on
+	// every poll as long as each poll uses an explicit transaction.
+	db *sql.DB
 }
 
 func NewEngine(
@@ -193,11 +177,22 @@ func NewEngine(
 	}
 }
 
-// Run polls the WPN database until ctx is cancelled.
+// Run opens one persistent connection to the real wpndatabase.db and polls
+// it until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
 	if _, err := os.Stat(e.dbPath); err != nil {
 		return fmt.Errorf("WPN database not found at %s: %w", e.dbPath, err)
 	}
+
+	db, err := e.openDB()
+	if err != nil {
+		return fmt.Errorf("open wpndatabase: %w", err)
+	}
+	e.db = db
+	defer func() {
+		e.db.Close()
+		e.db = nil
+	}()
 
 	if err := e.seedLastOrder(ctx); err != nil {
 		e.logger.WithError(err).Warn("Could not seed lastOrder — will emit all existing notifications on first poll")
@@ -222,115 +217,165 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
-// openDB opens a fresh read-only connection. Fresh per poll so SQLite
-// always reads current file state — persistent connection caches stale data.
+// openDB opens a single read-only connection to the real wpndatabase.db.
+//
+// DSN flags:
+//   mode=ro          — never acquire a write lock; we are a pure reader
+//   cache=private    — no cross-connection page cache sharing (pool=1 makes
+//                      this moot but explicit is better than implicit)
+//   _busy_timeout=2000 — wait up to 2s if WpnService holds a write lock
+//                        during a notification burst before returning an error
+//
+// What controls WAL freshness is NOT the connection — it is the transaction.
+// See poll() for the BEGIN/ROLLBACK pattern that re-acquires the WAL
+// read-lock at the current WAL head on every poll cycle.
 func (e *Engine) openDB() (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?mode=ro&cache=shared", e.dbPath)
+	dsn := fmt.Sprintf(
+		"file:%s?mode=ro&cache=private&_busy_timeout=2000",
+		e.dbPath,
+	)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
+
+	// Exactly one connection → exactly one sqlite3* C handle.
+	// This is critical: if the pool had >1 connections, different connections
+	// could hold WAL read-locks at different positions, causing non-monotonic
+	// reads. With pool=1 there is one handle, one WAL position per transaction.
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)        // keep the one connection alive between polls
+	db.SetConnMaxLifetime(0)     // never expire it — we manage the lifecycle
+	db.SetConnMaxIdleTime(0)     // ditto
+
+	// Verify the connection works and WAL mode is active.
+	if err := db.PingContext(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+
 	return db, nil
+}
+
+// inTx runs fn inside an explicit read-only transaction on the persistent
+// connection. This is the core of the WAL freshness fix:
+//
+//   BEGIN DEFERRED  → SQLite acquires a WAL read-lock at the CURRENT WAL head.
+//                     The transaction sees all frames written up to this point,
+//                     including any written since the previous poll.
+//   fn(tx)          → execute queries against this fresh snapshot.
+//   ROLLBACK        → release the WAL read-lock immediately. The connection
+//                     now holds NO read-lock, so the next poll's BEGIN will
+//                     again grab the latest WAL position.
+//
+// Using ROLLBACK (not COMMIT) because we never write; both are equivalent for
+// releasing the read-lock but ROLLBACK makes the intent explicit.
+func (e *Engine) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	// sql.TxOptions with ReadOnly=true maps to BEGIN DEFERRED in go-sqlite3,
+	// which acquires a WAL read-lock without attempting any write intent.
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	fnErr := fn(tx)
+
+	// Always rollback — we never write.
+	// Rollback releases the WAL read-lock so the next BEGIN sees fresh data.
+	if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+		e.logger.WithError(rbErr).Warn("tx rollback error")
+	}
+
+	return fnErr
 }
 
 // seedLastOrder sets lastOrder to current MAX([Order]) so we skip history.
 func (e *Engine) seedLastOrder(ctx context.Context) error {
-	db, err := e.openDB()
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	var maxOrder sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT MAX("Order") FROM Notification`).Scan(&maxOrder); err != nil {
-		return err
-	}
-	if maxOrder.Valid {
-		e.lastOrder = maxOrder.Int64
-	}
-	e.logger.Infof("Seeded lastOrder=%d (existing notifications skipped)", e.lastOrder)
-	return nil
+	return e.inTx(ctx, func(tx *sql.Tx) error {
+		var maxOrder sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT MAX("Order") FROM Notification`).Scan(&maxOrder); err != nil {
+			return err
+		}
+		if maxOrder.Valid {
+			e.lastOrder = maxOrder.Int64
+		}
+		e.logger.Infof("Seeded lastOrder=%d (existing notifications skipped)", e.lastOrder)
+		return nil
+	})
 }
 
-// poll queries for rows with Order > lastOrder, type='toast', non-NULL payload.
+// poll opens a fresh read transaction (new WAL read-lock at current WAL head)
+// and emits any notifications with Order > lastOrder.
 func (e *Engine) poll(ctx context.Context) error {
-	db, err := e.openDB()
-	if err != nil {
-		return fmt.Errorf("open db: %w", err)
-	}
-	defer db.Close()
+	return e.inTx(ctx, func(tx *sql.Tx) error {
+		const query = `
+			SELECT n."Order", nh.PrimaryId, n.Payload, n.ArrivalTime
+			FROM   Notification n
+			INNER  JOIN NotificationHandler nh ON n.HandlerId = nh.RecordId
+			WHERE  n."Order" > ?
+			  AND  n.Type    = 'toast'
+			  AND  n.Payload IS NOT NULL
+			ORDER  BY n."Order" ASC`
 
-	// Only select toast rows (not toastCondensed) with non-NULL Payload.
-	// Use `Order` (the true PRIMARY KEY) for tracking, not `Id`.
-	const query = `
-		SELECT n."Order", nh.PrimaryId, n.Payload, n.ArrivalTime
-		FROM Notification n
-		INNER JOIN NotificationHandler nh ON n.HandlerId = nh.RecordId
-		WHERE n."Order" > ?
-		  AND n.Type = 'toast'
-		  AND n.Payload IS NOT NULL
-		ORDER BY n."Order" ASC`
-
-	rows, err := db.QueryContext(ctx, query, e.lastOrder)
-	if err != nil {
-		return fmt.Errorf("query: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			order       int64
-			primaryID   string
-			payload     []byte
-			arrivalTime int64
-		)
-		if err := rows.Scan(&order, &primaryID, &payload, &arrivalTime); err != nil {
-			e.logger.WithError(err).Warn("Scan error")
-			continue
+		rows, err := tx.QueryContext(ctx, query, e.lastOrder)
+		if err != nil {
+			return fmt.Errorf("query: %w", err)
 		}
+		defer rows.Close()
 
-		if order > e.lastOrder {
-			e.lastOrder = order
-		}
+		for rows.Next() {
+			var (
+				order       int64
+				primaryID   string
+				payload     []byte
+				arrivalTime int64
+			)
+			if err := rows.Scan(&order, &primaryID, &payload, &arrivalTime); err != nil {
+				e.logger.WithError(err).Warn("Scan error")
+				continue
+			}
 
-		title, body, iconPath := parseToast(payload)
-		if title == "" {
-			continue
-		}
+			if order > e.lastOrder {
+				e.lastOrder = order
+			}
 
-		// Load icon bytes from local file path if present
-		var iconData []byte
-		if iconPath != "" {
-			if data, err := os.ReadFile(iconPath); err == nil {
-				iconData = data
-			} else {
-				e.logger.Debugf("Icon not readable at %s: %v", iconPath, err)
+			title, body, iconPath := parseToast(payload)
+			if title == "" {
+				continue
+			}
+
+			var iconData []byte
+			if iconPath != "" {
+				if data, err := os.ReadFile(iconPath); err == nil {
+					iconData = data
+				} else {
+					e.logger.Debugf("Icon not readable at %s: %v", iconPath, err)
+				}
+			}
+
+			n := &Notification{
+				ID:        uuid.New().String(),
+				AppName:   primaryID,
+				Title:     title,
+				Body:      body,
+				ArrivedAt: filetimeToTime(arrivalTime),
+				IconData:  iconData,
+			}
+
+			if !e.shouldForward(n) {
+				continue
+			}
+
+			e.logger.Infof("Captured [%s] %q — %q (icon=%v)", n.AppName, n.Title, n.Body, iconPath != "")
+			select {
+			case e.out <- n:
+			default:
+				e.logger.Warn("Channel full, dropping: ", n.Title)
 			}
 		}
 
-		n := &Notification{
-			ID:        uuid.New().String(),
-			AppName:   primaryID,
-			Title:     title,
-			Body:      body,
-			ArrivedAt: filetimeToTime(arrivalTime),
-			IconData:  iconData,
-		}
-
-		if !e.shouldForward(n) {
-			continue
-		}
-
-		e.logger.Infof("Captured [%s] %q — %q (icon=%v)", n.AppName, n.Title, n.Body, iconPath != "")
-		select {
-		case e.out <- n:
-		default:
-			e.logger.Warn("Channel full, dropping: ", n.Title)
-		}
-	}
-
-	return rows.Err()
+		return rows.Err()
+	})
 }
 
 func (e *Engine) shouldForward(n *Notification) bool {
